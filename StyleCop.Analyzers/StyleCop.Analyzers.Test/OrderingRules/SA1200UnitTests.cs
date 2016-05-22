@@ -128,6 +128,68 @@ namespace TestNamespace
             await this.VerifyCSharpFixAsync(testCode, fixedTestCode).ConfigureAwait(false);
         }
 
+        [Fact]
+        public async Task TestReorganizeUsingStatementsMaintainsReferencesAsync()
+        {
+            var sources = new[]
+            {
+                @"using DifferentNamespace;
+
+namespace OuterNamespace.InnerNamespace
+{
+    public class Implementation
+    {
+        private Conflict conflict;
+    }
+}
+",
+                @"namespace OuterNamespace
+{
+    public class Conflict
+    {
+    }
+}
+",
+                @"namespace DifferentNamespace
+{
+    public class Conflict
+    {
+    }
+}
+"
+            };
+
+            var fixedSources = new[]
+            {
+                @"namespace OuterNamespace.InnerNamespace
+{
+    using DifferentNamespace;
+
+    public class Implementation
+    {
+        private OuterNamespace.Conflict conflict;
+    }
+}
+",
+                @"namespace OuterNamespace
+{
+    public class Conflict
+    {
+    }
+}
+",
+                @"namespace DifferentNamespace
+{
+    public class Conflict
+    {
+    }
+}
+"
+            };
+
+            await this.VerifyCSharpFixAsync(sources, fixedSources).ConfigureAwait(false);
+        }
+
         /// <inheritdoc/>
         protected override IEnumerable<DiagnosticAnalyzer> GetCSharpDiagnosticAnalyzers()
         {
