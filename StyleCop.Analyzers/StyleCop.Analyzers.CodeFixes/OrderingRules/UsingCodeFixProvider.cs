@@ -3,6 +3,7 @@
 
 namespace StyleCop.Analyzers.OrderingRules
 {
+    using System;
     using System.Collections.Generic;
     using System.Collections.Immutable;
     using System.Composition;
@@ -71,11 +72,14 @@ namespace StyleCop.Analyzers.OrderingRules
 
         private static async Task<Document> GetTransformedDocumentAsync(Document document, SyntaxNode syntaxRoot, CancellationToken cancellationToken)
         {
+            var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
+            var nodesToTrack = GetStuff(syntaxRoot, semanticModel, cancellationToken).ToList();
+            syntaxRoot = syntaxRoot.TrackNodes(nodesToTrack);
+
             var fileHeader = GetFileHeader(syntaxRoot);
             var compilationUnit = (CompilationUnitSyntax)syntaxRoot;
 
             var settings = SettingsHelper.GetStyleCopSettings(document.Project.AnalyzerOptions, cancellationToken);
-            var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
 
             var usingsHelper = new UsingsHelper(settings, semanticModel, compilationUnit, fileHeader);
             var namespaceCount = CountNamespaces(compilationUnit.Members);
@@ -167,8 +171,21 @@ namespace StyleCop.Analyzers.OrderingRules
             newSyntaxRoot = ReAddFileHeader(newSyntaxRoot, fileHeader);
 
             var newDocument = document.WithSyntaxRoot(newSyntaxRoot.WithoutFormatting());
+            newDocument = await QualifyChangedTypesAsync(semanticModel, nodesToTrack, newDocument, cancellationToken).ConfigureAwait(false);
 
             return newDocument;
+        }
+
+        private static IEnumerable<SyntaxNode> GetStuff(SyntaxNode root, SemanticModel semanticModel, CancellationToken cancellationToken)
+        {
+            foreach (var node in root.DescendantNodes())
+            {
+                var symbol = semanticModel.GetSymbolInfo(node, cancellationToken).Symbol;
+                if (symbol != null)
+                {
+                    yield return node;
+                }
+            }
         }
 
         private static int CountNamespaces(SyntaxList<MemberDeclarationSyntax> members)
@@ -386,6 +403,83 @@ namespace StyleCop.Analyzers.OrderingRules
             var firstToken = syntaxRoot.GetFirstToken(includeZeroWidth: true);
             var newLeadingTrivia = firstToken.LeadingTrivia.InsertRange(0, fileHeader);
             return syntaxRoot.ReplaceToken(firstToken, firstToken.WithLeadingTrivia(newLeadingTrivia));
+        }
+
+        private static async Task<Document> QualifyChangedTypesAsync(SemanticModel originalSemanticModel, IEnumerable<SimpleNameSyntax> trackedNodes, Document document, CancellationToken cancellationToken)
+        {
+            var syntaxRoot = await document.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
+            var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
+
+            var updates = new Dictionary<SyntaxNode, SyntaxNode>();
+
+            foreach (var originalNode in trackedNodes)
+            {
+                var changedNode = syntaxRoot.GetCurrentNode(originalNode);
+
+                var originalSymbol = originalSemanticModel.GetSymbolInfo(originalNode).Symbol;
+
+                var qualifiedNode = QualifyNodeToMatchSymbol(semanticModel, changedNode, originalSymbol);
+                if (qualifiedNode != changedNode)
+                {
+                    updates[changedNode] = qualifiedNode;
+                }
+            }
+
+            syntaxRoot = syntaxRoot.ReplaceNodes(updates.Keys, (originalNode, updatedNode) => updates[originalNode]);
+            return document.WithSyntaxRoot(syntaxRoot);
+        }
+
+        private static SyntaxNode QualifyNodeToMatchSymbol(SemanticModel semanticModel, SimpleNameSyntax changedNode, ISymbol originalSymbol)
+        {
+            var updatedSymbol = semanticModel.GetSymbolInfo(changedNode).Symbol;
+            if (AreSameReference(originalSymbol, updatedSymbol))
+            {
+                return changedNode;
+            }
+
+            var position = changedNode.GetLocation().SourceSpan.Start;
+            var currentSymbol = originalSymbol.ContainingSymbol;
+            SyntaxNode currentNode = changedNode;
+
+            do
+            {
+                currentNode = SyntaxFactory.MemberAccessExpression(
+                    SyntaxKind.SimpleMemberAccessExpression,
+                    SyntaxFactory.IdentifierName(currentSymbol.Name).WithLeadingTrivia(currentNode.GetLeadingTrivia()),
+                    currentNode.WithoutLeadingTrivia().WithoutFormatting());
+                semanticModel.GetSpeculativeSymbolInfo(position, currentNode)
+            } while (true);
+
+            return currentNode;
+        }
+
+        private static bool AreSameReference(ISymbol left, ISymbol right)
+        {
+            while (true)
+            {
+                if (left == null ^ right == null)
+                {
+                    return false;
+                }
+                else if (left == null && right == null)
+                {
+                    return true;
+                }
+
+                if (left.GetType() != right.GetType() || left.Name != right.Name)
+                {
+                    return false;
+                }
+
+                var leftAssembly = left as IAssemblySymbol;
+                if (leftAssembly != null)
+                {
+                    return leftAssembly.Identity == ((IAssemblySymbol)right).Identity;
+                }
+
+                left = left.ContainingSymbol;
+                right = right.ContainingSymbol;
+            }
         }
 
         private class DirectiveSpan
